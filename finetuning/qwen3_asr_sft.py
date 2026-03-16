@@ -14,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import json
 import os
 import re
-import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -195,33 +195,11 @@ def parse_args():
     p = argparse.ArgumentParser("Qwen3-ASR Finetuning")
 
     # Paths
-    p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
+    p.add_argument("--train_conf", type=str, required=True,
+                   help="JSON config path with format: [training_args, model_args]")
     p.add_argument("--train_file", type=str, default="train.jsonl")
     p.add_argument("--eval_file", type=str, default="")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
-
-    # Audio
-    p.add_argument("--sr", type=int, default=16000)
-
-    # Train hyper-params
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--grad_acc", type=int, default=4)
-    p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--epochs", type=float, default=1)
-    p.add_argument("--log_steps", type=int, default=10)
-    p.add_argument("--lr_scheduler_type", type=str, default="linear")
-    p.add_argument("--warmup_ratio", type=float, default=0.02)
-
-    # DataLoader
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--pin_memory", type=int, default=1)
-    p.add_argument("--persistent_workers", type=int, default=1)
-    p.add_argument("--prefetch_factor", type=int, default=2)
-
-    # Save
-    p.add_argument("--save_strategy", type=str, default="steps")
-    p.add_argument("--save_steps", type=int, default=200)
-    p.add_argument("--save_total_limit", type=int, default=5)
 
     # Resume
     p.add_argument("--resume_from", type=str, default="")
@@ -230,15 +208,57 @@ def parse_args():
     return p.parse_args()
 
 
+def load_train_conf(train_conf_path: str) -> Optional[List[Dict[str, Any]]]:
+    if not train_conf_path:
+        return None
+
+    with open(train_conf_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if not isinstance(cfg, list) or len(cfg) != 2:
+        raise ValueError("train_conf must be a list in format: [training_args, model_args]")
+
+    training_args, model_args = cfg
+    if not isinstance(training_args, dict) or not isinstance(model_args, dict):
+        raise ValueError("train_conf entries must both be dictionaries")
+    return [training_args, model_args]
+
+
 def main():
     args_cli = parse_args()
+
+    train_conf = load_train_conf(args_cli.train_conf)
+    if train_conf is None:
+        raise ValueError("--train_conf is required")
+
+    training_args_conf, model_args_conf = train_conf
 
     if not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
 
+    model_path = model_args_conf.get("model_path")
+    if not model_path:
+        raise KeyError("model_args.model_path is required in train_conf")
+
+    sr = int(training_args_conf.get("sr", 16000))
+    batch_size = int(training_args_conf.get("per_device_train_batch_size", 32))
+    grad_acc = int(training_args_conf.get("gradient_accumulation_steps", 4))
+    learning_rate = float(training_args_conf.get("learning_rate", 2e-5))
+    num_train_epochs = float(training_args_conf.get("num_train_epochs", 1))
+    logging_steps = int(training_args_conf.get("logging_steps", 10))
+    lr_scheduler_type = training_args_conf.get("lr_scheduler_type", "linear")
+    warmup_ratio = float(training_args_conf.get("warmup_ratio", 0.02))
+    num_workers = int(training_args_conf.get("dataloader_num_workers", 4))
+    pin_memory = bool(training_args_conf.get("dataloader_pin_memory", True))
+    persistent_workers = bool(training_args_conf.get("dataloader_persistent_workers", True))
+    prefetch_factor = int(training_args_conf.get("dataloader_prefetch_factor", 2))
+    save_strategy = training_args_conf.get("save_strategy", "steps")
+    save_steps = int(training_args_conf.get("save_steps", 200))
+    save_total_limit = int(training_args_conf.get("save_total_limit", 5))
+
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     asr_wrapper = Qwen3ASRModel.from_pretrained(
-        args_cli.model_path,
+        model_path,
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
     )
@@ -263,27 +283,27 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
-    collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=args_cli.sr)
+    collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=sr)
 
     training_args = TrainingArguments(
         output_dir=args_cli.output_dir,
-        per_device_train_batch_size=args_cli.batch_size,
-        gradient_accumulation_steps=args_cli.grad_acc,
-        learning_rate=args_cli.lr,
-        num_train_epochs=args_cli.epochs,
-        logging_steps=args_cli.log_steps,
-        lr_scheduler_type=args_cli.lr_scheduler_type,
-        warmup_ratio=args_cli.warmup_ratio,
-        dataloader_num_workers=args_cli.num_workers,
-        dataloader_pin_memory=(args_cli.pin_memory == 1),
-        dataloader_persistent_workers=(args_cli.persistent_workers == 1),
-        dataloader_prefetch_factor=args_cli.prefetch_factor if args_cli.num_workers > 0 else None,
-        save_strategy=args_cli.save_strategy,
-        save_steps=args_cli.save_steps,
-        save_total_limit=args_cli.save_total_limit,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=grad_acc,
+        learning_rate=learning_rate,
+        num_train_epochs=num_train_epochs,
+        logging_steps=logging_steps,
+        lr_scheduler_type=lr_scheduler_type,
+        warmup_ratio=warmup_ratio,
+        dataloader_num_workers=num_workers,
+        dataloader_pin_memory=pin_memory,
+        dataloader_persistent_workers=persistent_workers,
+        dataloader_prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        save_strategy=save_strategy,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
         save_safetensors=True,
         eval_strategy="steps",
-        eval_steps=args_cli.save_steps,
+        eval_steps=save_steps,
         do_eval=bool(args_cli.eval_file),
         bf16=use_bf16,
         fp16=not use_bf16,
@@ -303,6 +323,12 @@ def main():
     )
 
     os.makedirs(training_args.output_dir, exist_ok=True)
+
+    if train_conf is not None and trainer.args.process_index == 0:
+        saved_train_conf = os.path.join(training_args.output_dir, "train_conf.json")
+        with open(saved_train_conf, "w", encoding="utf-8") as f:
+            json.dump(train_conf, f, ensure_ascii=False, indent=4)
+
     processor.save_pretrained(training_args.output_dir)
 
     if hasattr(processor, "tokenizer") and processor.tokenizer is not None:

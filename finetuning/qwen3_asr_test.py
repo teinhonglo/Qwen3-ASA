@@ -293,10 +293,10 @@ def write_prediction_files(
 def parse_args():
     p = argparse.ArgumentParser("Qwen3-ASR test script aligned with SFT prompt+audio training")
 
-    p.add_argument("--model_path", type=str, required=True,
-                   help="Checkpoint path or output_dir")
+    p.add_argument("--exp_dir", type=str, required=True,
+                   help="Experiment directory. Will load train_conf.json from this directory")
     p.add_argument("--auto_latest_checkpoint", action="store_true",
-                   help="If model_path is an output_dir, automatically use latest checkpoint")
+                   help="If exp_dir contains checkpoints, automatically use latest checkpoint")
 
     p.add_argument("--input_jsonl", type=str, required=True,
                    help="Input JSONL with fields like text_id, audio, prompt, text")
@@ -307,23 +307,45 @@ def parse_args():
     p.add_argument("--output_root", type=str, default="checkpoints",
                    help='Root output dir. Default: "checkpoints"')
 
-    p.add_argument("--sr", type=int, default=16000)
     p.add_argument("--device", type=str, default="cuda:0",
                    help='e.g. "cuda:0", "cuda:1", "cpu"')
-    p.add_argument("--dtype", type=str, default="auto",
-                   choices=["auto", "bfloat16", "float16", "float32"])
-    p.add_argument("--max_new_tokens", type=int, default=256)
-    p.add_argument("--do_sample", action="store_true")
-    p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--top_p", type=float, default=1.0)
-
     return p.parse_args()
+
+
+def load_train_conf_from_exp_dir(exp_dir: str) -> Optional[List[Dict[str, Any]]]:
+    if not exp_dir:
+        return None
+
+    train_conf_path = os.path.join(exp_dir, "train_conf.json")
+    if not os.path.isfile(train_conf_path):
+        raise FileNotFoundError(f"train_conf.json not found under exp_dir: {train_conf_path}")
+
+    with open(train_conf_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if not isinstance(cfg, list) or len(cfg) != 2:
+        raise ValueError("train_conf.json must be [training_args, model_args]")
+    if not isinstance(cfg[0], dict) or not isinstance(cfg[1], dict):
+        raise ValueError("Both train_conf entries must be dictionaries")
+    return cfg
 
 
 def main():
     args = parse_args()
 
-    model_path = args.model_path
+    train_conf = load_train_conf_from_exp_dir(args.exp_dir)
+    if train_conf is None:
+        raise ValueError("Unable to load train_conf from exp_dir")
+
+    training_args_conf, model_args_conf = train_conf
+    sr = int(training_args_conf.get("sr", 16000))
+    max_new_tokens = int(training_args_conf.get("max_new_tokens", 256))
+    do_sample = bool(training_args_conf.get("do_sample", False))
+    temperature = float(training_args_conf.get("temperature", 1.0))
+    top_p = float(training_args_conf.get("top_p", 1.0))
+    dtype_str = str(model_args_conf.get("dtype", "auto"))
+
+    model_path = args.exp_dir
     if args.auto_latest_checkpoint:
         latest_ckpt = find_latest_checkpoint(model_path)
         if latest_ckpt is None:
@@ -331,7 +353,7 @@ def main():
         model_path = latest_ckpt
         print(f"[info] use latest checkpoint: {model_path}")
 
-    dtype = resolve_dtype(args.dtype, args.device)
+    dtype = resolve_dtype(dtype_str, args.device)
     score_names = parse_score_names(args.score_name)
     jsonl_name = get_jsonl_name(args.input_jsonl)
 
@@ -358,11 +380,11 @@ def main():
             asr_wrapper=asr_wrapper,
             audio_path=audio_path,
             prompt=prompt,
-            sr=args.sr,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=args.do_sample,
-            temperature=args.temperature,
-            top_p=args.top_p,
+            sr=sr,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
         )
 
         pred_scores = try_parse_score_dict(pred_raw)
