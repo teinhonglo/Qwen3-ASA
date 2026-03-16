@@ -17,8 +17,8 @@ json_root="data-json/teemi/teemi-tb1p1"
 # training config
 nj=4
 gpuid=0
-model_path=Qwen/Qwen3-ASR-0.6B
 suffix=
+train_conf=finetuning/train_conf/teemi_qwen3_asr_06b.json
 
 # eval config
 bins="1.5,2.5,3.5,4.5,5.5,6.5,7.5"
@@ -38,10 +38,14 @@ test_sets="test"
 . ./local/parse_options.sh
 . ./path.sh
 
+if [ ! -f "$train_conf" ]; then
+    echo "[ERROR] train_conf not found: $train_conf"
+    exit 1
+fi
+
 trainset_tag=$(dirname $json_root | xargs basename)
 trans_tag=$(basename $json_root)
-#conf_tag=$(basename -s .json $train_conf)
-conf_tag=$(echo $model_path | sed -e "s:/:-:g" | tr '[:upper:]' '[:lower:]')
+conf_tag=$(basename -s .json $train_conf)
 exp_root=exp/$trainset_tag/$trans_tag/${conf_tag}${suffix}
 
 folds=`seq 1 $kfold`
@@ -68,22 +72,10 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
 
         CUDA_VISIBLE_DEVICES=$gpuid \
             python finetuning/qwen3_asr_sft.py \
-                --model_path $model_path \
+                --train_conf $train_conf \
                 --train_file $data_dir/train.jsonl \
                 --eval_file $data_dir/valid.jsonl \
-                --output_dir $exp_dir \
-                --batch_size 4 \
-                --grad_acc 32 \
-                --lr 2e-5 \
-                --epochs 3 \
-                --log_steps 10 \
-                --save_strategy steps \
-                --save_steps 200 \
-                --save_total_limit 5 \
-                --num_workers 2 \
-                --pin_memory 1 \
-                --persistent_workers 1 \
-                --prefetch_factor 2
+                --output_dir $exp_dir
     done
 fi
 
@@ -107,7 +99,7 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
 
             CUDA_VISIBLE_DEVICES="$gpuid" \
                 python finetuning/qwen3_asr_test.py \
-                    --model_path $exp_dir \
+                    --exp_dir $exp_dir \
                     --auto_latest_checkpoint \
                     --input_jsonl $test_jsonl \
                     --score_name "$scores" \
