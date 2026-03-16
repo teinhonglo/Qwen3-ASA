@@ -9,6 +9,32 @@ import argparse
 import pandas as pd
 
 
+PROMPT_TEMPLATE = """You are an English speaking test rater. Score the student's spoken response on four dimensions using the rubric below. The question text will be provided separately; evaluate relevance to that question.
+
+The original scores are binned with bins: [1, 2, 2.5, 3, 3.5, 4, 4.5, 5], and then converted by adding 1 to the bin index.
+Use integer score levels 1-8 for each dimension:
+- 1: very low (near raw score <= 1)
+- 2: low (around raw score in (1, 2])
+- 3: basic (around raw score in (2, 2.5])
+- 4: developing (around raw score in (2.5, 3])
+- 5: fair (around raw score in (3, 3.5])
+- 6: good (around raw score in (3.5, 4])
+- 7: very good (around raw score in (4, 4.5])
+- 8: excellent (around raw score in (4.5, 5])
+
+Scoring dimensions:
+1) content (topic relevance, coherence, richness)
+2) pronunciation (accuracy, rate, fluency)
+3) vocabulary (word use, grammar correctness)
+4) holistic (overall performance)
+
+Output format requirements:
+- Output ONE JSON object only.
+- Keys must be exactly: \"content\", \"vocabulary\", \"pronunciation\", \"holistic\".
+- Each value must be an integer from 1 to 8.
+- Do not output any explanation, markdown, or extra text."""
+
+
 def normalize_value(x):
     """Convert pandas/numpy values to plain Python values."""
     if pd.isna(x):
@@ -78,6 +104,13 @@ def build_prompt_from_text_id(text_id, prompt_info):
     return prompt.strip()
 
 
+def build_full_prompt(question_prompt: str) -> str:
+    question_prompt = (question_prompt or "").strip()
+    if question_prompt:
+        return f"{PROMPT_TEMPLATE}\n\n{question_prompt}"
+    return PROMPT_TEMPLATE
+
+
 def convert_one_tsv(
     tsv_path,
     jsonl_path,
@@ -110,7 +143,8 @@ def convert_one_tsv(
     with open(jsonl_path, "w", encoding="utf-8") as fout:
         for _, row in df.iterrows():
             text_id = str(row["text_id"]).strip()
-            prompt = build_prompt_from_text_id(text_id, prompt_info)
+            question_prompt = build_prompt_from_text_id(text_id, prompt_info)
+            prompt = build_full_prompt(question_prompt)
 
             score_dict = {
                 "content": normalize_value(row["content"]),
