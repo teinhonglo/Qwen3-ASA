@@ -12,12 +12,13 @@ parser.add_argument("--result_root",
                     type=str)
 
 parser.add_argument("--bins",
-                    type=str,
-                    help="for acc metrics when regression, e.g. '1.5,2.5,3.5,4.5,5.5,6.5,7.5'")
+                    type=str, 
+                    help="for acc metrics when regression, it should be '0,0.5,1,1.5,2'")
 
 parser.add_argument("--lv_intv",
                     type=float,
-                    default=0.5)
+                    default=0.5,
+                    help="for acc metrics when regression, it should be 0.5")
 
 parser.add_argument("--scores",
                     default="content pronunciation vocabulary",
@@ -31,6 +32,10 @@ parser.add_argument("--test_set",
                     default="dev",
                     type=str)
 
+parser.add_argument("--pred_fn",
+                    default="predictions.txt",
+                    type=str)
+
 parser.add_argument("--suffix",
                     default="",
                     type=str)
@@ -41,6 +46,7 @@ parser.add_argument("--merge-speaker",
 args = parser.parse_args()
 
 result_root = args.result_root
+pred_fn = args.pred_fn
 bins = np.array([float(b) for b in args.bins.split(",")]) if args.bins else None
 scores = args.scores.split()
 folds = args.folds.split()
@@ -55,16 +61,12 @@ def predictions_to_list(predictions_file, merge_speaker=False):
     with open(predictions_file, "r", encoding="utf-8") as rf:
         for line in rf:
             result = line.strip().split()
-            if len(result) < 3:
-                continue
-
             utt_id, pred, label = result[0], result[1], result[2]
 
             if merge_speaker:
                 # e.g. A01_u49_t9_p4_i19_1-5_20220919_0 -> use u49
                 parts = utt_id.split("_")
-                if len(parts) > 1:
-                    utt_id = parts[1]
+                utt_id = parts[1]
 
             pred_dict[utt_id].append(float(pred))
             label_dict[utt_id].append(float(label))
@@ -79,30 +81,32 @@ def predictions_to_list(predictions_file, merge_speaker=False):
 
     return ids, preds, labels
 
-
+# NOTE: calculate each fold results then average
 avg_results = {}
-
 for score in scores:
-    avg_results[score] = defaultdict(float)
 
+    # calculate average results of k-folds
+    avg_results[score] = defaultdict(lambda:0.0)
+
+    # store all ids, preds, labels
     all_ids, all_preds, all_labels = [], [], []
     valid_fold_count = 0
 
+    # for each fold calculate results
     for fold in folds:
         predictions_file = f"{result_root}/{fold}/{test_set}/predictions_{score}.txt"
         results_file = f"{result_root}/{fold}/{test_set}/results_{score}{suffix}.log"
 
         if not os.path.isfile(predictions_file):
-            print(f"[WARNING] missing: {predictions_file}")
-            continue
+            raise ValueError(f"[Error] missing: {predictions_file}")
 
         os.makedirs(os.path.dirname(results_file), exist_ok=True)
 
         ids, preds, labels = predictions_to_list(
             predictions_file,
-            merge_speaker=args.merge_speaker,
+            merge_speaker=args.merge_speaker
         )
-
+        
         if len(ids) == 0:
             raise ValueError(f"[WARNING] empty predictions: {predictions_file}")
 
@@ -129,6 +133,7 @@ for score in scores:
                 lv_intv=args.lv_intv,
             )
 
+        # write fold results.txt
         with open(results_file, "w", encoding="utf-8") as wf:
             if args.bins:
                 wf.write(f"with bins {bins}\n")

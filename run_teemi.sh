@@ -18,7 +18,8 @@ json_root="data-json/teemi/teemi-tb1p1"
 nj=4
 gpuid=0
 suffix=
-train_conf=finetuning/train_conf/teemi_qwen3_asr_06b.json
+train_conf=conf/teemi_qwen3_asr_06b.json
+seed=66
 
 # eval config
 bins="1.5,2.5,3.5,4.5,5.5,6.5,7.5"
@@ -71,7 +72,7 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
         exp_dir=$exp_root/$score/$fd
 
         CUDA_VISIBLE_DEVICES=$gpuid \
-            python finetuning/qwen3_asr_sft.py \
+            python finetuning/qwen3_asr_sft.py  --seed $seed \
                 --train_conf $train_conf \
                 --train_file $data_dir/train.jsonl \
                 --eval_file $data_dir/valid.jsonl \

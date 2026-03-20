@@ -9,30 +9,31 @@ import argparse
 import pandas as pd
 
 
-PROMPT_TEMPLATE = """You are an English speaking test rater. Score the student's spoken response on four dimensions using the rubric below. The question text will be provided separately; evaluate relevance to that question.
+PROMPT_TEMPLATE = """You are an English speaking test rater. Score the student's spoken response on four dimensions based on the rubric below. The question text will be provided separately. Evaluate relevance to that question.
 
-The original scores are binned with bins: [1, 2, 2.5, 3, 3.5, 4, 4.5, 5], and then converted by adding 1 to the bin index.
+<<QUESTION>>
+
 Use integer score levels 1-8 for each dimension:
-- 1: very low (near raw score <= 1)
-- 2: low (around raw score in (1, 2])
-- 3: basic (around raw score in (2, 2.5])
-- 4: developing (around raw score in (2.5, 3])
-- 5: fair (around raw score in (3, 3.5])
-- 6: good (around raw score in (3.5, 4])
-- 7: very good (around raw score in (4, 4.5])
-- 8: excellent (around raw score in (4.5, 5])
+- 1 = very low
+- 2 = low
+- 3 = basic
+- 4 = developing
+- 5 = fair
+- 6 = good
+- 7 = very good
+- 8 = excellent
 
 Scoring dimensions:
-1) content (topic relevance, coherence, richness)
-2) pronunciation (accuracy, rate, fluency)
-3) vocabulary (word use, grammar correctness)
-4) holistic (overall performance)
+1) content: topic relevance, coherence, richness
+2) pronunciation: accuracy, rate, fluency
+3) vocabulary: word use, grammar correctness
+4) holistic: overall performance
 
 Output format requirements:
-- Output ONE JSON object only.
-- Keys must be exactly: \"content\", \"vocabulary\", \"pronunciation\", \"holistic\".
+- Output exactly one JSON object.
+- Keys must be exactly: "content", "vocabulary", "pronunciation", "holistic"
 - Each value must be an integer from 1 to 8.
-- Do not output any explanation, markdown, or extra text."""
+- Do not output any explanation or extra text."""
 
 
 def normalize_value(x):
@@ -105,9 +106,8 @@ def build_prompt_from_text_id(text_id, prompt_info):
 
 
 def build_full_prompt(question_prompt: str) -> str:
-    question_prompt = (question_prompt or "").strip()
     if question_prompt:
-        return f"{PROMPT_TEMPLATE}\n\n{question_prompt}"
+        return PROMPT_TEMPLATE.replace("<<QUESTION>>", question_prompt)
     return PROMPT_TEMPLATE
 
 

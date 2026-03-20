@@ -19,6 +19,8 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import numpy as np
+import random
 
 import librosa
 import torch
@@ -197,6 +199,7 @@ def parse_args():
     # Paths
     p.add_argument("--train_conf", type=str, required=True,
                    help="JSON config path with format: [training_args, model_args]")
+    p.add_argument('--seed', type=int, default=66)
     p.add_argument("--train_file", type=str, default="train.jsonl")
     p.add_argument("--eval_file", type=str, default="")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
@@ -226,6 +229,16 @@ def load_train_conf(train_conf_path: str) -> Optional[List[Dict[str, Any]]]:
 
 def main():
     args_cli = parse_args()
+
+    seed = args_cli.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
     train_conf = load_train_conf(args_cli.train_conf)
     if train_conf is None:
