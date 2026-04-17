@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -27,8 +28,9 @@ import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
 from transformers import (GenerationConfig, Trainer, TrainerCallback,
-                          TrainingArguments)
-
+                          TrainingArguments, BitsAndBytesConfig)
+from peft import LoraConfig, TaskType, get_peft_model
+from peft.peft_model import PeftModel
 
 def patch_outer_forward(model):
     cls = model.__class__
@@ -155,6 +157,28 @@ class DataCollatorForQwen3ASRFinetuning:
         return full_inputs
 
 
+def extract_default_prompt(dataset) -> str:
+    prompts = []
+    for ex in dataset:
+        p = str(ex.get("prompt", "") or "").strip()
+        if p:
+            prompts.append(p)
+
+    if not prompts:
+        return ""
+
+    first = prompts[0]
+    if any(p != first for p in prompts[1:]):
+        print("[warn] Multiple prompt values found in train set; using the first non-empty prompt for prompt.txt")
+    return first
+
+
+def save_prompt_txt(save_dir: str, prompt: str):
+    os.makedirs(save_dir, exist_ok=True)
+    prompt_path = os.path.join(save_dir, "prompt.txt")
+    with open(prompt_path, "w", encoding="utf-8") as f:
+        f.write(prompt or "")
+
 class CastFloatInputsTrainer(Trainer):
     def _prepare_inputs(self, inputs):
         inputs = super()._prepare_inputs(inputs)
@@ -166,9 +190,10 @@ class CastFloatInputsTrainer(Trainer):
         return inputs
 
 class MakeEveryCheckpointInferableCallback(TrainerCallback):
-    def __init__(self, processor, model=None):
+    def __init__(self, processor, model=None, default_prompt: str = ""):
         self.processor = processor
         self.model = model
+        self.default_prompt = default_prompt
 
     def _save_infer_files(self, save_dir: str):
         os.makedirs(save_dir, exist_ok=True)
@@ -181,6 +206,8 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         if self.model is not None and getattr(self.model, "generation_config", None) is not None:
             self.model.generation_config.save_pretrained(save_dir)
 
+        save_prompt_txt(save_dir, self.default_prompt)
+
     def on_save(self, args: TrainingArguments, state, control, **kwargs):
         if args.process_index != 0:
             return control
@@ -192,6 +219,37 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         self._save_infer_files(ckpt_dir)
         return control
 
+def save_best_checkpoint(
+    best_src: str,
+    output_dir: str,
+    processor=None,
+    model=None,
+    default_prompt: str = "",
+    best_ckpt_name: str = "checkpoint-best",
+):
+    if not best_src or not os.path.isdir(best_src):
+        print(
+            "[best] checkpoint-best not created: no best_model_checkpoint was selected. "
+            "Please make sure evaluation runs and load_best_model_at_end=true."
+        )
+        return
+
+    best_ckpt_dir = os.path.join(output_dir, best_ckpt_name)
+    if os.path.exists(best_ckpt_dir):
+        shutil.rmtree(best_ckpt_dir)
+    shutil.copytree(best_src, best_ckpt_dir)
+
+    if processor is not None:
+        processor.save_pretrained(best_ckpt_dir)
+        if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+            processor.tokenizer.save_pretrained(best_ckpt_dir)
+
+    if model is not None and getattr(model, "generation_config", None) is not None:
+        model.generation_config.save_pretrained(best_ckpt_dir)
+
+    save_prompt_txt(best_ckpt_dir, default_prompt)
+    print(f"[best] Saved best checkpoint from {best_src} to {best_ckpt_dir}")
+
 
 def parse_args():
     p = argparse.ArgumentParser("Qwen3-ASR Finetuning")
@@ -201,7 +259,7 @@ def parse_args():
                    help="JSON config path with format: [training_args, model_args]")
     p.add_argument('--seed', type=int, default=66)
     p.add_argument("--train_file", type=str, default="train.jsonl")
-    p.add_argument("--eval_file", type=str, default="")
+    p.add_argument("--eval_file", type=str, default="dev.jsonl")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
 
     # Resume
@@ -209,7 +267,6 @@ def parse_args():
     p.add_argument("--resume", type=int, default=0)
 
     return p.parse_args()
-
 
 def load_train_conf(train_conf_path: str) -> Optional[List[Dict[str, Any]]]:
     if not train_conf_path:
@@ -225,7 +282,6 @@ def load_train_conf(train_conf_path: str) -> Optional[List[Dict[str, Any]]]:
     if not isinstance(training_args, dict) or not isinstance(model_args, dict):
         raise ValueError("train_conf entries must both be dictionaries")
     return [training_args, model_args]
-
 
 def main():
     args_cli = parse_args()
@@ -245,6 +301,7 @@ def main():
         raise ValueError("--train_conf is required")
 
     training_args_conf, model_args_conf = train_conf
+    training_args_conf = dict(training_args_conf)
 
     if not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
@@ -253,39 +310,67 @@ def main():
     if not model_path:
         raise KeyError("model_args.model_path is required in train_conf")
 
-    sr = int(training_args_conf.get("sr", 16000))
-    batch_size = int(training_args_conf.get("per_device_train_batch_size", 32))
-    grad_acc = int(training_args_conf.get("gradient_accumulation_steps", 4))
-    learning_rate = float(training_args_conf.get("learning_rate", 2e-5))
-    num_train_epochs = float(training_args_conf.get("num_train_epochs", 1))
-    logging_steps = int(training_args_conf.get("logging_steps", 10))
-    lr_scheduler_type = training_args_conf.get("lr_scheduler_type", "linear")
-    warmup_ratio = float(training_args_conf.get("warmup_ratio", 0.02))
-    num_workers = int(training_args_conf.get("dataloader_num_workers", 4))
-    pin_memory = bool(training_args_conf.get("dataloader_pin_memory", True))
-    persistent_workers = bool(training_args_conf.get("dataloader_persistent_workers", True))
-    prefetch_factor = int(training_args_conf.get("dataloader_prefetch_factor", 2))
-    save_strategy = training_args_conf.get("save_strategy", "steps")
-    save_steps = int(training_args_conf.get("save_steps", 200))
-    save_total_limit = int(training_args_conf.get("save_total_limit", 5))
+    sr = int(model_args_conf.get("sr", 16000))
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
-    asr_wrapper = Qwen3ASRModel.from_pretrained(
-        model_path,
-        dtype=torch.bfloat16 if use_bf16 else torch.float16,
-        device_map=None,
-    )
+    # LoRA
+    lora_config = model_args_conf.get("lora_config", None)
+    lora_type = model_args_conf.get("lora_type", "default")
+    
+    if lora_type == "qlora":
+        # load pretrained model (reload)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+        asr_wrapper = Qwen3ASRModel.from_pretrained(
+            model_path,
+            dtype=torch.bfloat16 if use_bf16 else torch.float16,
+            quantization_config=bnb_config,
+            device_map=None,
+        )
+    else:
+        # load pretrained model
+        asr_wrapper = Qwen3ASRModel.from_pretrained(
+            model_path,
+            dtype=torch.bfloat16 if use_bf16 else torch.float16,
+            device_map=None,
+        )
+        
     model = asr_wrapper.model
     processor = asr_wrapper.processor
 
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
+    
+    if lora_config:
+        if lora_type not in ["default", "qlora"]:
+            raise ValueError(f"lora_type: {lora_type} is NOT implemented yet.")
+
+        print(f"LoRA Finetuning {lora_type}")
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            **lora_config
+        )
+        
+        model = get_peft_model(model, peft_config)
+        print("="*100)
+        model.print_trainable_parameters()
+        print("="*100)
+    else:
+        print("Full Finetuning")
+    
+    if training_args_conf["gradient_checkpointing"]:
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable()
 
     raw_ds = load_dataset(
         "json",
         data_files={
             "train": args_cli.train_file,
-            **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
+            "validation": args_cli.eval_file,
         },
     )
     ds = raw_ds.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
@@ -296,43 +381,37 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
+    default_prompt = extract_default_prompt(ds["train"])
+
     collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=sr)
+
+    training_args_conf["run_name"] = os.path.basename(args_cli.output_dir)
+    if model_args_conf.get("wandb_project"):
+        os.environ["WANDB_PROJECT"] = model_args_conf["wandb_project"]
+    os.environ["WANDB_LOG_MODEL"] = str(model_args_conf.get("wandb_log_model", "false")).lower()
 
     training_args = TrainingArguments(
         output_dir=args_cli.output_dir,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_acc,
-        learning_rate=learning_rate,
-        num_train_epochs=num_train_epochs,
-        logging_steps=logging_steps,
-        lr_scheduler_type=lr_scheduler_type,
-        warmup_ratio=warmup_ratio,
-        dataloader_num_workers=num_workers,
-        dataloader_pin_memory=pin_memory,
-        dataloader_persistent_workers=persistent_workers,
-        dataloader_prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        save_strategy=save_strategy,
-        save_steps=save_steps,
-        save_total_limit=save_total_limit,
-        save_safetensors=True,
-        eval_strategy="steps",
-        eval_steps=save_steps,
-        do_eval=bool(args_cli.eval_file),
+        do_eval=True,
         bf16=use_bf16,
         fp16=not use_bf16,
-        ddp_find_unused_parameters=False,
-        remove_unused_columns=False,
-        report_to="none",
+        **training_args_conf
     )
 
     trainer = CastFloatInputsTrainer(
         model=model,
         args=training_args,
         train_dataset=ds["train"],
-        eval_dataset=ds.get("validation", None),
+        eval_dataset=ds["validation"],
         data_collator=collator,
         tokenizer=processor.tokenizer,
-        callbacks=[MakeEveryCheckpointInferableCallback(processor=processor, model=model)],
+        callbacks=[
+            MakeEveryCheckpointInferableCallback(
+                processor=processor,
+                model=model,
+                default_prompt=default_prompt,
+            ),
+        ],
     )
 
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -360,6 +439,16 @@ def main():
         trainer.train(resume_from_checkpoint=resume_from)
     else:
         trainer.train()
+
+    if trainer.args.process_index == 0:
+        save_best_checkpoint(
+            best_src=getattr(trainer.state, "best_model_checkpoint", None),
+            output_dir=training_args.output_dir,
+            processor=processor,
+            model=model,
+            default_prompt=default_prompt,
+        )
+        save_prompt_txt(training_args.output_dir, default_prompt)
 
 
 if __name__ == "__main__":

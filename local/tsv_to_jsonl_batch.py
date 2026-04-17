@@ -33,10 +33,10 @@ Output format requirements:
 - Output exactly one JSON object.
 - Keys must be exactly: "content", "vocabulary", "pronunciation", "holistic"
 - Each value must be an integer from 1 to 8.
-- Do not output any explanation or extra text."""
+"""
 
 
-def normalize_value(x):
+def normalize_value(x, verbalized=False):
     """Convert pandas/numpy values to plain Python values."""
     if pd.isna(x):
         return None
@@ -59,13 +59,13 @@ def build_text(score_dict, language="English", include_tsv_text=False, transcrip
     If include_tsv_text=True:
         language English<asr_text>TRANSCRIPT{"content": 3, "vocabulary": 4, "pronunciation": 4}
     """
-    score_json = json.dumps(score_dict, ensure_ascii=False)
 
     if include_tsv_text and transcript is not None:
         transcript = str(transcript).strip()
-        return f"language {language}<asr_text>{transcript}{score_json}"
+        score_dict["asr_text"] = transcription
 
-    return f"language {language}<asr_text>{score_json}"
+    score_json = json.dumps(score_dict, ensure_ascii=False)
+    return f"language {language}<asr_text>{score_json}", score_dict
 
 
 def build_prompt_from_text_id(text_id, prompt_info):
@@ -147,15 +147,17 @@ def convert_one_tsv(
             prompt = build_full_prompt(question_prompt)
 
             score_dict = {
-                "content": normalize_value(row["content"]),
-                "vocabulary": normalize_value(row["vocabulary"]),
-                "pronunciation": normalize_value(row["pronunciation"]),
+                "asa_scores": {
+                    "content": normalize_value(row["content"]),
+                    "vocabulary": normalize_value(row["vocabulary"]),
+                    "pronunciation": normalize_value(row["pronunciation"]),
+                }
             }
 
             if include_holistic and "holistic" in df.columns:
                 score_dict["holistic"] = normalize_value(row["holistic"])
 
-            text_value = build_text(
+            text_value, score_dict = build_text(
                 score_dict=score_dict,
                 language=language,
                 include_tsv_text=include_tsv_text,
@@ -167,6 +169,7 @@ def convert_one_tsv(
                 "audio": str(row["wav_path"]).strip(),
                 "prompt": prompt,
                 "text": text_value,
+                "label_json": score_dict
             }
 
             fout.write(json.dumps(sample, ensure_ascii=False) + "\n")

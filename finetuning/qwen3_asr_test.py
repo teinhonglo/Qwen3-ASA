@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import librosa
 import torch
 from qwen_asr import Qwen3ASRModel
-
+from peft.peft_model import PeftModelForCausalLM
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
 
@@ -106,7 +106,6 @@ def extract_payload_text(raw_text: str) -> str:
         return m.group(1).strip()
     return raw_text
 
-
 def try_parse_score_dict(text: str) -> Dict[str, Any]:
     """
     Robustly parse score json from model output / label text.
@@ -163,7 +162,7 @@ def infer_one(
     sr: int = 16000,
     max_new_tokens: int = 256,
     do_sample: bool = False,
-    temperature: float = 1.0,
+    temperature: float = 0.0,
     top_p: float = 1.0,
 ) -> str:
     processor = asr_wrapper.processor
@@ -192,7 +191,8 @@ def infer_one(
     if do_sample:
         gen_kwargs["temperature"] = temperature
         gen_kwargs["top_p"] = top_p
-
+    
+    model.eval()
     with torch.inference_mode():
         gen_out = model.generate(**inputs, **gen_kwargs)
 
@@ -269,7 +269,6 @@ def get_jsonl_name(input_jsonl: str) -> str:
     name, _ = os.path.splitext(base)
     return name
 
-
 def write_prediction_files(
     rows_out: List[Dict[str, Any]],
     score_names: List[str],
@@ -278,6 +277,21 @@ def write_prediction_files(
 ):
     save_dir = os.path.join(output_root, jsonl_name)
     os.makedirs(save_dir, exist_ok=True)
+    # jsonl
+    out_path = os.path.join(save_dir, "predictions.jsonl")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        for row in rows_out:
+            item = {
+                "text_id": row["text_id"],
+                "transcription": row.get("transcription", ""),
+                "label_scores": row.get("label_scores", []),
+                "pred_transcription": row.get("pred_transcription", ""),
+                "pred_scores": row.get("pred_scores", []),
+            }
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    print(f"[info] saved: {out_path}")
 
     for score in score_names:
         out_path = os.path.join(save_dir, f"predictions_{score}.txt")
@@ -291,7 +305,7 @@ def write_prediction_files(
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Qwen3-ASR test script aligned with SFT prompt+audio training")
+    p = argparse.ArgumentParser("Qwen3-ASA test script")
 
     p.add_argument("--exp_dir", type=str, required=True,
                    help="Experiment directory. Will load train_conf.json from this directory")
@@ -338,11 +352,11 @@ def main():
         raise ValueError("Unable to load train_conf from exp_dir")
 
     training_args_conf, model_args_conf = train_conf
-    sr = int(training_args_conf.get("sr", 16000))
-    max_new_tokens = int(training_args_conf.get("max_new_tokens", 256))
-    do_sample = bool(training_args_conf.get("do_sample", False))
-    temperature = float(training_args_conf.get("temperature", 1.0))
-    top_p = float(training_args_conf.get("top_p", 1.0))
+    sr = int(model_args_conf.get("sr", 16000))
+    max_new_tokens = int(model_args_conf.get("max_new_tokens", 256))
+    do_sample = bool(model_args_conf.get("do_sample", False))
+    temperature = float(model_args_conf.get("temperature", 0.0))
+    top_p = float(model_args_conf.get("top_p", 1.0))
     dtype_str = str(model_args_conf.get("dtype", "auto"))
 
     model_path = args.exp_dir
@@ -357,11 +371,31 @@ def main():
     score_names = parse_score_names(args.score_name)
     jsonl_name = get_jsonl_name(args.input_jsonl)
 
-    asr_wrapper = Qwen3ASRModel.from_pretrained(
-        model_path,
-        dtype=dtype,
-        device_map=args.device,
-    )
+    # LoRA
+    lora_config = model_args_conf.get("lora_config", None)
+    if lora_config:
+        lora_type = model_args_conf.get("lora_type", "default")
+        print(f"LoRA Finetuning {lora_type}")
+        lora_path = model_path
+        model_path = model_args_conf["model_path"]
+
+        asr_wrapper = Qwen3ASRModel.from_pretrained(
+            model_path,
+            dtype=dtype,
+            device_map=args.device,
+        )
+        asr_wrapper.model = PeftModelForCausalLM.from_pretrained(
+            asr_wrapper.model,
+            lora_path,
+            torch_dtype=torch.bfloat16,
+        )
+    else:
+        print("Full Finetuning")
+        asr_wrapper = Qwen3ASRModel.from_pretrained(
+            model_path,
+            dtype=dtype,
+            device_map=args.device,
+        )
 
     rows = load_jsonl(args.input_jsonl)
     rows_out = []
@@ -370,7 +404,7 @@ def main():
         text_id = str(row.get("text_id", f"line{i}")).strip()
         audio_path = row.get("audio", "")
         prompt = row.get("prompt", "")
-        label_text = row.get("text", "")
+        label_json = row.get("label_json", "")
 
         if not audio_path:
             print(f"[skip] line {i}: no audio field")
@@ -387,19 +421,24 @@ def main():
             top_p=top_p,
         )
 
-        pred_scores = try_parse_score_dict(pred_raw)
-        label_scores = try_parse_score_dict(label_text)
+        pred_json = try_parse_score_dict(pred_raw)
+        
+        pred_transcription = pred_json.get("asr_text", "")
+        transcription = label_json.get("asr_text", "")
+        
+        pred_scores = pred_json["asa_scores"]
+        label_scores = label_json["asa_scores"]
 
         rows_out.append({
             "text_id": text_id,
-            "pred_raw": pred_raw,
-            "label_raw": label_text,
+            "pred_transcription": pred_transcription,
+            "transcription": transcription,
             "pred_scores": pred_scores,
             "label_scores": label_scores,
         })
 
         print(f"[{i}/{len(rows)}] done: {text_id}")
-
+     
     write_prediction_files(
         rows_out=rows_out,
         score_names=score_names,

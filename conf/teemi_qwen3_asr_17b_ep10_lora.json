@@ -1,10 +1,10 @@
 [
     {
-        "per_device_train_batch_size": 1,
+        "per_device_train_batch_size": 2,
         "per_device_eval_batch_size": 4,
-        "gradient_accumulation_steps": 128,
-        "learning_rate": 2e-5,
-        "num_train_epochs": 3,
+        "gradient_accumulation_steps": 64,
+        "learning_rate": 5e-4,
+        "num_train_epochs": 10,
         "warmup_ratio": 0.02,
         "save_strategy": "steps",
         "save_steps": 200,
@@ -37,6 +37,14 @@
         "temperature": 1.0,
         "top_p": 1.0,
         "freeze_components": [],
+        "lora_type": "default",
+        "lora_config": {
+            "r": 8,
+            "lora_alpha": 32,
+            "lora_dropout": 0.1,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "modules_to_save": ["embed_tokens", "lm_head"]
+        },
         "wandb_project": "qwen3-asr-finetuning",
         "wandb_log_model": "false"
     }

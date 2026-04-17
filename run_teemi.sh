@@ -118,12 +118,6 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
     result_root=${exp_root}/${score}
 
     for test_set in $test_sets; do
-        pred_path=${result_root}/1/${test_set}/predictions_content.txt
-        if [ ! -f "$pred_path" ]; then
-            echo "[WARNING] prediction file not found: $pred_path"
-            continue
-        fi
-
         # utterance-level
         python local/make_report.py \
             --result_root $result_root \
