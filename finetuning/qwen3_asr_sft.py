@@ -31,6 +31,7 @@ from transformers import (GenerationConfig, Trainer, TrainerCallback,
                           TrainingArguments, BitsAndBytesConfig)
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.peft_model import PeftModel
+from local.metrics_np import compute_metrics
 
 def patch_outer_forward(model):
     cls = model.__class__
@@ -180,6 +181,12 @@ def save_prompt_txt(save_dir: str, prompt: str):
         f.write(prompt or "")
 
 class CastFloatInputsTrainer(Trainer):
+    def __init__(self, *args, processor, score_metric_conf=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.processor = processor
+        self.score_metric_conf = score_metric_conf or {}
+        self.process_index = self.args.process_index
+
     def _prepare_inputs(self, inputs):
         inputs = super()._prepare_inputs(inputs)
         model_dtype = getattr(self.model, "dtype", None)
@@ -188,6 +195,124 @@ class CastFloatInputsTrainer(Trainer):
                 if torch.is_tensor(v) and v.is_floating_point():
                     inputs[k] = v.to(dtype=model_dtype)
         return inputs
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval", **kwargs):
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+            **kwargs,
+        )
+
+        if self.process_index != 0:
+            return metrics
+
+        score_conf = self.score_metric_conf
+
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            raise ValueError("Score metrics evaluation requires an eval dataset, but got None.")
+
+        extra_metrics = self._compute_eval_score_metrics(dataset, score_conf, metric_key_prefix)
+        if extra_metrics:
+            metrics.update(extra_metrics)
+            self.log(extra_metrics)
+        return metrics
+
+    def _compute_eval_score_metrics(self, eval_dataset, score_conf, metric_key_prefix: str) -> Dict[str, float]:
+        processor = self.processor
+
+        model = self.model
+        model_dtype = torch.float16
+        if hasattr(model, "dtype"):
+            model_dtype = model.dtype
+        device = next(model.parameters()).device
+        sr = int(score_conf.get("sr", 16000))
+        max_new_tokens = int(score_conf.get("max_new_tokens", 256))
+        do_sample = bool(score_conf.get("do_sample", False))
+        temperature = float(score_conf.get("temperature", 0.0))
+        top_p = float(score_conf.get("top_p", 1.0))
+        lv_intv = float(score_conf.get("lv_intv", 0.5))
+        bins = score_conf.get("bins")
+        max_eval_samples = int(score_conf.get("max_eval_samples", -1))
+
+        score_names = score_conf.get("score_names") or []
+        score_names = [str(x).strip() for x in score_names if str(x).strip()]
+
+        pred_dict = {}
+        label_dict = {}
+
+        n_total = len(eval_dataset)
+        if max_eval_samples > 0:
+            n_total = min(n_total, max_eval_samples)
+        if n_total == 0:
+            return {}
+
+        model_was_training = model.training
+        model.eval()
+        for idx in range(n_total):
+            ex = eval_dataset[idx]
+
+            raw_pred = infer_one(
+                processor=processor,
+                model=model,
+                audio_path=ex["audio"],
+                prompt=ex.get("prompt", ""),
+                sr=sr,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                device=device,
+                model_dtype=model_dtype,
+            )
+            pred_scores = parse_score_dict(raw_pred)
+            label_scores = parse_score_dict(ex.get("target", ""))
+
+            if not score_names and label_scores:
+                score_names = sorted(label_scores.keys())
+                for name in score_names:
+                    pred_dict[name] = []
+                    label_dict[name] = []
+
+            for name in score_names:
+                pred = to_float(pred_scores.get(name))
+                label = to_float(label_scores.get(name))
+                if pred is None or label is None:
+                    continue
+                pred_dict.setdefault(name, []).append(pred)
+                label_dict.setdefault(name, []).append(label)
+
+        if model_was_training:
+            model.train()
+
+        out = {}
+        valid_scores = 0
+        aggregate = {}
+        for score_name in score_names:
+            preds = np.array(pred_dict.get(score_name, []), dtype=np.float32)
+            labels = np.array(label_dict.get(score_name, []), dtype=np.float32)
+            if len(preds) == 0 or len(labels) == 0:
+                continue
+            cur = {}
+            compute_metrics(
+                cur,
+                preds,
+                labels,
+                bins=bins,
+                lv_intv=lv_intv,
+            )
+            valid_scores += 1
+            for k, v in cur.items():
+                aggregate[k] = aggregate.get(k, 0.0) + float(v)
+                out[f"{metric_key_prefix}_{score_name}_{k}"] = float(v)
+
+        if valid_scores > 0:
+            for k, v in aggregate.items():
+                out[f"{metric_key_prefix}_avg_{k}"] = v / valid_scores
+            out[f"{metric_key_prefix}_score_metrics_num_samples"] = float(n_total)
+
+        return out
 
 class MakeEveryCheckpointInferableCallback(TrainerCallback):
     def __init__(self, processor, model=None, default_prompt: str = ""):
@@ -267,6 +392,154 @@ def parse_args():
     p.add_argument("--resume", type=int, default=0)
 
     return p.parse_args()
+
+
+def build_prefix_text(processor, prompt: str) -> str:
+    prefix_msgs = build_prefix_messages(prompt, None)
+    prefix_text = processor.apply_chat_template(
+        [prefix_msgs],
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    if isinstance(prefix_text, list):
+        prefix_text = prefix_text[0]
+    return prefix_text
+
+
+def move_inputs_to_device(inputs: Dict[str, Any], device: str, model_dtype: torch.dtype):
+    new_inputs = {}
+    for k, v in inputs.items():
+        if torch.is_tensor(v):
+            v = v.to(device)
+            if v.is_floating_point():
+                v = v.to(model_dtype)
+        new_inputs[k] = v
+    return new_inputs
+
+
+def unwrap_generate_output(gen_out):
+    if hasattr(gen_out, "sequences"):
+        return gen_out.sequences
+    if isinstance(gen_out, dict) and "sequences" in gen_out:
+        return gen_out["sequences"]
+    if isinstance(gen_out, (tuple, list)):
+        return gen_out[0]
+    return gen_out
+
+
+def batch_decode_text(processor, token_ids):
+    if hasattr(processor, "batch_decode"):
+        return processor.batch_decode(
+            token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+    return processor.tokenizer.batch_decode(
+        token_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+
+def infer_one(
+    processor,
+    model,
+    audio_path: str,
+    prompt: str = "",
+    sr: int = 16000,
+    max_new_tokens: int = 256,
+    do_sample: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    device=None,
+    model_dtype=None,
+) -> str:
+    if device is None:
+        device = next(model.parameters()).device
+    if model_dtype is None:
+        model_dtype = getattr(model, "dtype", torch.float16)
+
+    wav = load_audio(audio_path, sr=sr)
+    prefix_text = build_prefix_text(processor, prompt)
+    inputs = processor(
+        text=[prefix_text],
+        audio=[wav],
+        return_tensors="pt",
+        padding=True,
+        truncation=False,
+    )
+    prefix_len = int(inputs["attention_mask"][0].sum().item())
+    inputs = move_inputs_to_device(inputs, device=device, model_dtype=model_dtype)
+
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+    }
+    if do_sample:
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = top_p
+
+    with torch.inference_mode():
+        gen_out = model.generate(**inputs, **gen_kwargs)
+    output_ids = unwrap_generate_output(gen_out)
+
+    if not torch.is_tensor(output_ids):
+        return ""
+
+    if output_ids.dim() == 1:
+        output_ids = output_ids.unsqueeze(0)
+    if output_ids.size(1) > prefix_len:
+        gen_only_ids = output_ids[:, prefix_len:]
+    else:
+        gen_only_ids = output_ids
+    return batch_decode_text(processor, gen_only_ids)[0].strip()
+
+
+def extract_payload_text(raw_text: str) -> str:
+    raw_text = (raw_text or "").strip()
+    m = re.match(r"^language\s+.+?<asr_text>(.*)$", raw_text, flags=re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return raw_text
+
+
+_NUMERIC_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def parse_score_dict(text: str) -> Dict[str, float]:
+    payload = extract_payload_text(text)
+
+    try:
+        obj = json.loads(payload)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    m = re.search(r"\{.*\}", payload, flags=re.DOTALL)
+    if m:
+        candidate = m.group(0)
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    return {}
+
+
+def to_float(x) -> Optional[float]:
+    if isinstance(x, bool):
+        return float(int(x))
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if _NUMERIC_RE.match(s):
+            return float(s)
+    return None
+
 
 def load_train_conf(train_conf_path: str) -> Optional[List[Dict[str, Any]]]:
     if not train_conf_path:
@@ -405,6 +678,18 @@ def main():
         eval_dataset=ds["validation"],
         data_collator=collator,
         tokenizer=processor.tokenizer,
+        processor=processor,
+        score_metric_conf={
+            "score_names": model_args_conf.get("score_names", []),
+            "bins": model_args_conf.get("bins"),
+            "lv_intv": float(model_args_conf.get("lv_intv", 0.5)),
+            "max_new_tokens": int(model_args_conf.get("max_new_tokens", 256)),
+            "do_sample": bool(model_args_conf.get("do_sample", False)),
+            "temperature": float(model_args_conf.get("temperature", 0.0)),
+            "top_p": float(model_args_conf.get("top_p", 1.0)),
+            "sr": sr,
+            "max_eval_samples": int(model_args_conf.get("score_metrics_max_eval_samples", -1)),
+        },
         callbacks=[
             MakeEveryCheckpointInferableCallback(
                 processor=processor,
